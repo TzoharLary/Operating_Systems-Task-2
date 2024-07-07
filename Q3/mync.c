@@ -9,7 +9,8 @@
 #include <arpa/inet.h>
 #include <getopt.h>
 #include <netdb.h>
-
+#include <fcntl.h>
+#include <poll.h>
 
 #define BUFFER_SIZE 1024
 
@@ -66,16 +67,12 @@ void start_tcp_server(int port, int *client_fd) {
         perror("accept");
         exit(EXIT_FAILURE);
     }
-    close(server_fd);  // סגירת server_fd לאחר קבלת client_fd
+    close(server_fd);
 }
-
-
 
 void start_tcp_client(const char *hostname, int port, int *client_fd) {
     struct addrinfo hints, *res, *p;
     int sockfd;
-
-    printf("start_tcp_client: hostname=%s, port=%d\n", hostname, port);  // הודעת debug נוספת
 
     memset(&hints, 0, sizeof hints);
     hints.ai_family = AF_UNSPEC;
@@ -96,8 +93,6 @@ void start_tcp_client(const char *hostname, int port, int *client_fd) {
             continue;
         }
 
-        printf("start_tcp_client: trying to connect to %s\n", hostname);  // הודעת debug נוספת
-
         if (connect(sockfd, p->ai_addr, p->ai_addrlen) == -1) {
             close(sockfd);
             perror("connect");
@@ -113,38 +108,50 @@ void start_tcp_client(const char *hostname, int port, int *client_fd) {
     }
 
     *client_fd = sockfd;
-
     freeaddrinfo(res);
-
-    printf("TCP client connected to %s:%d, client_fd=%d\n", hostname, port, *client_fd);  // הודעת debug נוספת
 }
 
-
-void copy_pipe_to_tcp(int pipe_fd, int tcp_fd) {
+void handle_io(int input_fd, int output_fd) {
     char buffer[BUFFER_SIZE];
-    ssize_t n;
-    printf("Entering copy_pipe_to_tcp function\n");
+    struct pollfd fds[2];
+    int nfds = 2;
 
-    while ((n = read(pipe_fd, buffer, BUFFER_SIZE)) > 0) {
-        printf("copy_pipe_to_tcp: read %ld bytes from pipe\n", n);
-        if (write(tcp_fd, buffer, n) != n) {
-            perror("write to tcp");
-            break;
+    fds[0].fd = input_fd;
+    fds[0].events = POLLIN;
+    fds[1].fd = output_fd;
+    fds[1].events = POLLIN;
+
+    while (1) {
+        int ret = poll(fds, nfds, -1);
+        if (ret == -1) {
+            perror("poll");
+            exit(EXIT_FAILURE);
         }
-        printf("copy_pipe_to_tcp: wrote %ld bytes to tcp\n", n);
-    }
 
-    if (n == -1) {
-        perror("read from pipe");
+        for (int i = 0; i < nfds; i++) {
+            if (fds[i].revents & POLLIN) {
+                ssize_t n = read(fds[i].fd, buffer, BUFFER_SIZE);
+                if (n <= 0) {
+                    if (n < 0) perror("read");
+                    return;
+                }
+                int dest_fd = (fds[i].fd == input_fd) ? output_fd : STDOUT_FILENO;
+                if (write(dest_fd, buffer, n) != n) {
+                    perror("write");
+                    return;
+                }
+            }
+        }
     }
-    printf("copy_pipe_to_tcp: finished copying data\n");
 }
+
 
 int main(int argc, char *argv[]) {
     int opt;
     char *command = NULL;
     char *input_param = NULL;
     char *output_param = NULL;
+    int is_bidirectional = 0;
 
     while ((opt = getopt(argc, argv, "e:i:o:b:")) != -1) {
         switch (opt) {
@@ -159,42 +166,27 @@ int main(int argc, char *argv[]) {
                 break;
             case 'b':
                 input_param = output_param = optarg;
+                is_bidirectional = 1;
                 break;
             default:
-                fprintf(stderr, "Usage: %s -e \"command\" [-i input] [-o output] [-b both]\n", argv[0]);
+                fprintf(stderr, "Usage: %s [-e \"command\"] [-i input] [-o output] [-b both]\n", argv[0]);
                 return EXIT_FAILURE;
         }
     }
 
-    if (!command) {
-        fprintf(stderr, "Command is required\n");
-        return EXIT_FAILURE;
-    }
-
-    int input_fd = -1, output_fd = -1;
-
-    // Debugging the value of input_param and output_param
-    printf("Initial input_param: %s\n", input_param);
-    printf("Initial output_param: %s\n", output_param);
+    int input_fd = STDIN_FILENO;
+    int output_fd = STDOUT_FILENO;
 
     if (input_param && strncmp(input_param, "TCPS", 4) == 0) {
         int port = atoi(input_param + 4);
-        printf("Starting TCP server on port %d\n", port);
         start_tcp_server(port, &input_fd);
-        output_fd = input_fd;  // לשימוש גם בקלט וגם בפלט
-        printf("TCP server started on port %d, client connected\n", port);
+        if (is_bidirectional) {
+            output_fd = input_fd;
+        }
     }
 
-    if (output_param && strncmp(output_param, "TCPC", 4) == 0) {
-        printf("Output parameter: %s\n", output_param);
+    if (output_param && strncmp(output_param, "TCPC", 4) == 0 && !is_bidirectional) {
         char *output_param_copy = strdup(output_param + 4);
-        if (!output_param_copy) {
-            fprintf(stderr, "Memory allocation failed\n");
-            return EXIT_FAILURE;
-        }
-
-        printf("Output parameter copy: %s\n", output_param_copy);
-
         char *hostname = strtok(output_param_copy, ",");
         char *port_str = strtok(NULL, ",");
         if (hostname == NULL || port_str == NULL) {
@@ -202,95 +194,59 @@ int main(int argc, char *argv[]) {
             free(output_param_copy);
             return EXIT_FAILURE;
         }
-
-        printf("Parsed hostname: %s, port_str: %s\n", hostname, port_str);
-
         int port = atoi(port_str);
-        if (port == 0) {
-            fprintf(stderr, "Invalid port\n");
-            free(output_param_copy);
+        start_tcp_client(hostname, port, &output_fd);
+        free(output_param_copy);
+    }
+
+    if (command) {
+        int pipe_out[2];
+        if (pipe(pipe_out) == -1) {
+            perror("pipe");
             return EXIT_FAILURE;
         }
 
-        printf("Connecting to TCP client at %s:%d\n", hostname, port);
-        start_tcp_client(hostname, port, &output_fd);
-        input_fd = output_fd;  // לשימוש גם בקלט וגם בפלט
-        printf("start_tcp_client called\n");
-        free(output_param_copy);
-        printf("Connected to TCP client at %s:%d, output_fd=%d\n", hostname, port, output_fd);
-    }
-
-    printf("Output parameter after parsing: %s\n", output_param);
-
-    int pipe_out[2];
-
-    if (pipe(pipe_out) == -1) {
-        perror("pipe");
-        return EXIT_FAILURE;
-    }
-
-    pid_t pid = fork();
-
-    if (pid == -1) {
-        perror("fork");
-        return EXIT_FAILURE;
-    }
-
-    if (pid == 0) { // Child process
-        printf("Child: process started\n");
-        if (input_fd != -1) {
-            printf("Child: redirecting stdin from TCP server/client\n");
-            dup2(input_fd, STDIN_FILENO);
+        pid_t pid = fork();
+        if (pid == -1) {
+            perror("fork");
+            return EXIT_FAILURE;
         }
 
-        // Redirect stdout
-        close(pipe_out[0]);
-        if (output_fd != -1) {
-            printf("Child: redirecting stdout to TCP client\n");
-            dup2(output_fd, STDOUT_FILENO);
-        } else {
-            printf("Child: redirecting stdout to pipe\n");
-            dup2(pipe_out[1], STDOUT_FILENO);
-        }
-        close(pipe_out[1]);
-
-        // Execute the command
-        printf("Child: executing command\n");
-        execute_program(command);
-        printf("Child: command execution finished\n"); // Should not reach here
-    } else { // Parent process
-        printf("Parent: process started\n");
-        close(pipe_out[1]);
-
-        if (output_fd != -1) {
-            printf("Parent: output_fd is set to %d, preparing to copy data from pipe to tcp\n", output_fd);
-            copy_pipe_to_tcp(pipe_out[0], output_fd);
-            printf("Parent: finished copying data from pipe to tcp\n");
-            close(output_fd);
-            printf("Parent: closed output_fd\n");
-        } else {
-            printf("Parent: output_fd is not set, reading from pipe\n");
-            char buffer[BUFFER_SIZE];
-            ssize_t n;
-
-            while ((n = read(pipe_out[0], buffer, BUFFER_SIZE - 1)) > 0) {
-                buffer[n] = '\0';
-                write(STDOUT_FILENO, buffer, n);
+        if (pid == 0) { // Child process
+            if (input_fd != STDIN_FILENO) {
+                dup2(input_fd, STDIN_FILENO);
             }
-
-            if (n == -1) {
-                perror("read");
+            close(pipe_out[0]);
+            if (output_fd != STDOUT_FILENO) {
+                dup2(output_fd, STDOUT_FILENO);
+            } else {
+                dup2(pipe_out[1], STDOUT_FILENO);
             }
+            close(pipe_out[1]);
+            execute_program(command);
+        } else { // Parent process
+            close(pipe_out[1]);
+            if (output_fd != STDOUT_FILENO) {
+                handle_io(pipe_out[0], output_fd);
+            } else {
+                char buffer[BUFFER_SIZE];
+                ssize_t n;
+                while ((n = read(pipe_out[0], buffer, BUFFER_SIZE - 1)) > 0) {
+                    buffer[n] = '\0';
+                    write(STDOUT_FILENO, buffer, n);
+                }
+            }
+            close(pipe_out[0]);
+            wait(NULL);
         }
-
-        close(pipe_out[0]);
-        printf("Parent: closed pipe_out[0]\n");
-
-        // Wait for child to finish
-        printf("Parent: waiting for child to finish\n");
-        wait(NULL);
-        printf("Parent: child process finished\n");
+    } else {
+        // Handle I/O without executing a command
+        handle_io(input_fd, output_fd);
     }
+
+    // Close file descriptors
+    if (input_fd != STDIN_FILENO) close(input_fd);
+    if (output_fd != STDOUT_FILENO && output_fd != input_fd) close(output_fd);
 
     return EXIT_SUCCESS;
 }
@@ -299,9 +255,10 @@ int main(int argc, char *argv[]) {
 
 
 
+
 // Example 1: Running `mync` with input from a TCP server and output to a TCP client
 
-// ./mync -e “ttt 123456789” -i TCPS4090 -o TCPClocalhost,4455
+// ./mync -e “./ttt 123456789” -i TCPS4090 -o TCPClocalhost,4455
 // To run this, first open a new terminal and start a TCP server listening on port 4455:
 // nc -l -p 4455
 // After that, run the following command in the original terminal:
