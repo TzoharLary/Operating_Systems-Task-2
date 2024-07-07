@@ -173,58 +173,54 @@ int main(int argc, char *argv[]) {
 
     int input_fd = -1, output_fd = -1;
 
-    // Debugging the value of output_param
+    // Debugging the value of input_param and output_param
+    printf("Initial input_param: %s\n", input_param);
     printf("Initial output_param: %s\n", output_param);
 
     if (input_param && strncmp(input_param, "TCPS", 4) == 0) {
         int port = atoi(input_param + 4);
         printf("Starting TCP server on port %d\n", port);
         start_tcp_server(port, &input_fd);
+        output_fd = input_fd;  // לשימוש גם בקלט וגם בפלט
         printf("TCP server started on port %d, client connected\n", port);
     }
 
-    if (output_param) {
-        printf("Checking output_param value: %s\n", output_param);
-        if (strncmp(output_param, "TCPC", 4) == 0) {
-            printf("Output parameter matches 'TCPC': %s\n", output_param);  // הודעת debug נוספת
-            char *output_param_copy = strdup(output_param + 4);
-            if (!output_param_copy) {
-                fprintf(stderr, "Memory allocation failed\n");
-                return EXIT_FAILURE;
-            }
-
-            printf("Output parameter copy: %s\n", output_param_copy); // הודעת debug נוספת
-
-            char *hostname = strtok(output_param_copy, ",");
-            char *port_str = strtok(NULL, ",");
-            if (hostname == NULL || port_str == NULL) {
-                fprintf(stderr, "Invalid TCPC parameters\n");
-                free(output_param_copy);
-                return EXIT_FAILURE;
-            }
-
-            printf("Parsed hostname: %s, port_str: %s\n", hostname, port_str); // הודעת debug נוספת
-
-            int port = atoi(port_str);
-            if (port == 0) {
-                fprintf(stderr, "Invalid port\n");
-                free(output_param_copy);
-                return EXIT_FAILURE;
-            }
-
-            printf("Connecting to TCP client at %s:%d\n", hostname, port);
-            start_tcp_client(hostname, port, &output_fd);
-            printf("start_tcp_client called\n");  // הודעת debug נוספת
-            free(output_param_copy);
-            printf("Connected to TCP client at %s:%d, output_fd=%d\n", hostname, port, output_fd);
-        } else {
-            printf("Output parameter does not match 'TCPC': %s\n", output_param);  // הודעת debug נוספת
+    if (output_param && strncmp(output_param, "TCPC", 4) == 0) {
+        printf("Output parameter: %s\n", output_param);
+        char *output_param_copy = strdup(output_param + 4);
+        if (!output_param_copy) {
+            fprintf(stderr, "Memory allocation failed\n");
+            return EXIT_FAILURE;
         }
-    } else {
-        printf("Output parameter is NULL\n");  // הודעת debug נוספת
+
+        printf("Output parameter copy: %s\n", output_param_copy);
+
+        char *hostname = strtok(output_param_copy, ",");
+        char *port_str = strtok(NULL, ",");
+        if (hostname == NULL || port_str == NULL) {
+            fprintf(stderr, "Invalid TCPC parameters\n");
+            free(output_param_copy);
+            return EXIT_FAILURE;
+        }
+
+        printf("Parsed hostname: %s, port_str: %s\n", hostname, port_str);
+
+        int port = atoi(port_str);
+        if (port == 0) {
+            fprintf(stderr, "Invalid port\n");
+            free(output_param_copy);
+            return EXIT_FAILURE;
+        }
+
+        printf("Connecting to TCP client at %s:%d\n", hostname, port);
+        start_tcp_client(hostname, port, &output_fd);
+        input_fd = output_fd;  // לשימוש גם בקלט וגם בפלט
+        printf("start_tcp_client called\n");
+        free(output_param_copy);
+        printf("Connected to TCP client at %s:%d, output_fd=%d\n", hostname, port, output_fd);
     }
 
-    printf("Output parameter after parsing: %s\n", output_param);  // הודעת debug נוספת
+    printf("Output parameter after parsing: %s\n", output_param);
 
     int pipe_out[2];
 
@@ -243,9 +239,8 @@ int main(int argc, char *argv[]) {
     if (pid == 0) { // Child process
         printf("Child: process started\n");
         if (input_fd != -1) {
-            printf("Child: redirecting stdin from TCP server\n");
+            printf("Child: redirecting stdin from TCP server/client\n");
             dup2(input_fd, STDIN_FILENO);
-            close(input_fd);
         }
 
         // Redirect stdout
@@ -253,7 +248,6 @@ int main(int argc, char *argv[]) {
         if (output_fd != -1) {
             printf("Child: redirecting stdout to TCP client\n");
             dup2(output_fd, STDOUT_FILENO);
-            close(output_fd);
         } else {
             printf("Child: redirecting stdout to pipe\n");
             dup2(pipe_out[1], STDOUT_FILENO);
