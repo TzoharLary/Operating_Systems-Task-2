@@ -258,13 +258,18 @@ int main(int argc, char *argv[]) {
 
 // Example 1: Running `mync` with input from a TCP server and output to a TCP client
 
-// ./mync -e “./ttt 123456789” -i TCPS4090 -o TCPClocalhost,4455
+// ./mync -e "./ttt 123456789" -i TCPS4050 -o TCPClocalhost,4455
+
 // To run this, first open a new terminal and start a TCP server listening on port 4455:
-// nc -l -p 4455
+// nc -l 4455
+
 // After that, run the following command in the original terminal:
 // ./mync -e “ttt 123456789” -i TCPS4090 -o TCPClocalhost,4455
+
 // Finally, open another terminal and run:
-// telnet localhost 4090
+// telnet localhost 4050
+
+
 
 // Example 2: Running `mync` with output to a TCP client
 
@@ -283,9 +288,13 @@ int main(int argc, char *argv[]) {
 // telnet localhost 4095
 
 // Example 4: Running `mync` with input from a TCP server
+// ./mync -e "./ttt 123456789" -i TCPS4050
 
-// ./mync -e "ttt 123456789" -i TCPS4092
 // To run this, use the following command in the original terminal:
-// ./mync -e "ttt 123456789" -i TCPS4092
+// ./mync -e "./ttt 123456789" -i TCPS4050
 // Then, open another terminal and run:
-// telnet localhost 4092
+// nc localhost 4050
+
+
+//./mync -e "./ttt 123456789" -i TCPS4050 
+//./mync -e "./ttt 123456789" -i UDPS4050
