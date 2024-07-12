@@ -119,49 +119,66 @@ void start_tcp_client(const char *hostname, int port, int *client_fd) {
 int start_udp_server(int port) {
     int sockfd;
 
-    // Create socket
+    // Create a socket for IPv6 UDP communication
+    // AF_INET6 is the address family for IPv6
+    // SOCK_DGRAM is the socket type for UDP
+    // 0 is the protocol value, which is 0 because it is automatically chosen based on the address family and socket type
     sockfd = socket(AF_INET6, SOCK_DGRAM, 0);  // SOCK_DGRAM for UDP
     if (sockfd < 0) {
+        // If socket creation fails, print an error message and exit
         perror("socket creation failed");
         exit(EXIT_FAILURE);
     }
-    printf("Socket created with fd: %d\n", sockfd);  // Debugging line
+    // Debugging line to confirm socket creation
+    printf("Socket created with fd: %d\n", sockfd);
 
-    int opt = 1;
+    int opt = 0;
 
     // Allow the socket to bind to both IPv4 and IPv6 addresses
     if (setsockopt(sockfd, IPPROTO_IPV6, IPV6_V6ONLY, &opt, sizeof(opt)) < 0) {
+        // If setting socket option fails, print an error message and exit
         perror("setsockopt IPV6_V6ONLY failed");
         close(sockfd);
         exit(EXIT_FAILURE);
     }
-    printf("setsockopt IPV6_V6ONLY succeeded\n");  // Debugging line
+    // Debugging line to confirm setsockopt success for IPV6_V6ONLY
+    printf("setsockopt IPV6_V6ONLY succeeded\n");
 
+    opt = 1;
+
+    // Set the socket option to reuse the address, allowing the server to restart quickly after a crash
     if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
+        // If setting socket option fails, print an error message and exit
         perror("setsockopt SO_REUSEADDR failed");
         close(sockfd);
         exit(EXIT_FAILURE);
     }
-    printf("setsockopt SO_REUSEADDR succeeded\n");  // Debugging line
+    // Debugging line to confirm setsockopt success for SO_REUSEADDR
+    printf("setsockopt SO_REUSEADDR succeeded\n");
 
+    // Initialize server address structure to zero
     struct sockaddr_in6 server_addr;
-
     memset(&server_addr, 0, sizeof(server_addr));
     
-    // Fill server information
-    server_addr.sin6_family = AF_INET6; // IPv6
+    // Fill server information for IPv6
+    server_addr.sin6_family = AF_INET6; // Set address family to IPv6
     server_addr.sin6_addr = in6addr_any; // Accept connections on any IP address (both IPv4 and IPv6)
-    server_addr.sin6_port = htons(port);
+    server_addr.sin6_port = htons(port); // Set the port number, converting from host byte order to network byte order
 
     // Bind the socket with the server address
     if (bind(sockfd, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
+        // If binding the socket fails, print an error message and exit
         perror("bind failed");
         close(sockfd);
         exit(EXIT_FAILURE);
     }
-    printf("bind succeeded\n");  // Debugging line
+    // Debugging line to confirm successful bind
+    printf("bind succeeded\n");
 
+    // Print the message that the UDP server has started
     printf("UDP server started on port %d\n", port);
+    
+    // Return the socket file descriptor
     return sockfd;
 }
 
@@ -240,16 +257,7 @@ int is_socket(int fd) {
     return result == 0;
 }
 
-void send_test_message(int fd, struct sockaddr_in *dest_addr, socklen_t dest_addr_len) {
-    const char *test_message = "Test message";
-    ssize_t sent = sendto(fd, test_message, strlen(test_message), 0, (struct sockaddr *)dest_addr, dest_addr_len);
-    if (sent == -1) {
-        perror("sendto");
-        printf("Failed to send test message\n");
-    } else {
-        printf("Sent test message: %s\n", test_message);
-    }
-}
+
 
 void check_open_fds() {
     printf("Open file descriptors:\n");
@@ -296,10 +304,19 @@ void handle_io(int pipe_fd, int socket_fd, int output_fd, int input_is_udp, int 
     // }
 
     while (1) {
-        printf("Polling for events...\n");
+        // printf("Polling for events...\n");
         int ret = poll(fds, nfds, -1);
-        printf("After poll, ret = %d\n", ret);
-
+        
+        // Printing which fds have data ready
+        printf("After poll, the fds that have data ready are: \n");
+        if (fds[0].revents & POLLIN) {
+            printf("pipe_fd.\n");
+        }
+        if (fds[1].revents & POLLIN) {
+            printf("socket_fd.\n");
+        }
+        printf("\n");
+       
         if (ret == -1) {
             perror("poll");
             exit(EXIT_FAILURE);
@@ -307,14 +324,14 @@ void handle_io(int pipe_fd, int socket_fd, int output_fd, int input_is_udp, int 
 
         // Handle pipe input (output from child process)
         if (fds[0].revents & POLLIN) {
-            printf("fds[0].revents & POLLIN\n");
             ssize_t n = read(fds[0].fd, buffer, BUFFER_SIZE);
+            printf("this is the input from the pipe ---%s--- \n", buffer);
             if (n <= 0) {
                 if (n < 0) perror("read");
                 return;
             }
             buffer[n] = '\0';
-            printf("on fds[0].revents & POLLIN condition, Received from pipe: %s\n", buffer);
+            // printf("on fds[0].revents & POLLIN condition, Received from pipe: %s\n", buffer);
 
             // Send to output_fd (could be a socket or STDOUT)
             if (output_is_udp) {
@@ -324,13 +341,16 @@ void handle_io(int pipe_fd, int socket_fd, int output_fd, int input_is_udp, int 
                     return;
                 }
                 printf("Sent %zd bytes to %s:%d\n", sent, inet_ntoa(dest_addr->sin_addr), ntohs(dest_addr->sin_port));
-            } else {
+            }
+            // output is not udp
+             else {
                 ssize_t written = write(output_fd, buffer, n);
+                printf("this is the output from the socket +++%s+++ \n", buffer);
                 if (written != n) {
                     perror("write");
                     return;
                 }
-                printf("on fds[0].revents & POLLIN condition, Written: %s\n", buffer);
+                // printf("on fds[0].revents & POLLIN condition, Written: %s\n", buffer);
             }
         }
 
@@ -352,7 +372,7 @@ void handle_io(int pipe_fd, int socket_fd, int output_fd, int input_is_udp, int 
                 }
             }
             buffer[n] = '\0';
-            printf("Received from socket: %s\n", buffer);
+            // printf("Received from socket: %s\n", buffer);
 
             // Send to output_fd (could be a pipe or another socket)
             if (output_is_udp) {
@@ -368,7 +388,7 @@ void handle_io(int pipe_fd, int socket_fd, int output_fd, int input_is_udp, int 
                     perror("write");
                     return;
                 }
-                printf("Written: %s\n", buffer);
+                // printf("Written: %s\n", buffer);
             }
    
         }
@@ -559,3 +579,31 @@ int main(int argc, char *argv[]) {
 
     return EXIT_SUCCESS;
 }
+
+
+    // Example usage:
+
+    // Example 1: Run a command with input from a UDp server to the standard output (STDOUT)
+    // run the following command in the terminal
+    //  ./mync -e "./ttt 123456789" -i UDPS4050
+    // open another terminal and run the following command
+    // nc -u localhost 4050
+
+    // Example 2: Run a command with input from a UDP server and kill the process after 10 seconds
+    // run the following command in the terminal
+    // ./mync -e "./ttt 123456789" -i UDPS4050 -t 10
+    // open another terminal and run the following command
+    // nc -u localhost 4050
+
+    // Example 3: Run a command with input from a UDP server and output to a TCP client
+    // run the following command in the terminal for listening to the TCP client at port 4455
+    // nc -l 4455 
+    // open another terminal and run the following command for running the mync program 
+    // with the ttt command and input from the UDP server at port 4050 and output to the TCP client at port 4455
+    // ./mync -e "./ttt 123456789" -i UDPS4050 -o TCPClocalhost,4455
+    // open another terminal and run the following command for sending data to the UDP server at port 4050
+    // nc -u localhost 4050
+    //
+
+
+
