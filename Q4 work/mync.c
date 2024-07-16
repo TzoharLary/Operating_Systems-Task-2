@@ -264,92 +264,102 @@ void start_udp_client(const char *hostname, int port, int *client_fd, struct soc
     freeaddrinfo(res);
 }
 
-void start_udssd_server(const char *path) {
-    int sockfd;
+void start_udssd_server(const char *path, int *sockfd) {
     struct sockaddr_un servaddr;
 
-    sockfd = socket(AF_UNIX, SOCK_DGRAM, 0);
+    *sockfd = socket(AF_UNIX, SOCK_DGRAM, 0);
+    if (*sockfd < 0) {
+        perror("socket creation failed");
+        exit(EXIT_FAILURE);
+    }
+
     memset(&servaddr, 0, sizeof(servaddr));
     servaddr.sun_family = AF_UNIX;
     strcpy(servaddr.sun_path, path);
 
-    bind(sockfd, (struct sockaddr*)&servaddr, sizeof(servaddr));
-
-    // קבלת הודעות (Datagram)
-    while (1) {
-        char buffer[1024];
-        recvfrom(sockfd, buffer, sizeof(buffer), 0, NULL, NULL);
-        printf("Received: %s\n", buffer);
+    if (bind(*sockfd, (struct sockaddr*)&servaddr, sizeof(servaddr)) < 0) {
+        perror("bind failed");
+        close(*sockfd);
+        exit(EXIT_FAILURE);
     }
 
-    close(sockfd);
+    printf("UNIX Domain Datagram server started on path %s\n", path);
 }
 
-void start_udsdc_client(const char *path) {
-    int sockfd;
+void start_udsdc_client(const char *path, int *sockfd) {
     struct sockaddr_un servaddr;
 
-    sockfd = socket(AF_UNIX, SOCK_DGRAM, 0);
+    *sockfd = socket(AF_UNIX, SOCK_DGRAM, 0);
+    if (*sockfd < 0) {
+        perror("socket creation failed");
+        exit(EXIT_FAILURE);
+    }
+
     memset(&servaddr, 0, sizeof(servaddr));
     servaddr.sun_family = AF_UNIX;
     strcpy(servaddr.sun_path, path);
 
-    // שליחת הודעות (Datagram)
-    while (1) {
-        char buffer[1024];
-        fgets(buffer, sizeof(buffer), stdin);
-        sendto(sockfd, buffer, strlen(buffer), 0, (struct sockaddr*)&servaddr, sizeof(servaddr));
-    }
-
-    close(sockfd);
+    printf("UNIX Domain Datagram client started on path %s\n", path);
 }
 
-void start_udsss_server(const char *path) {
-    int sockfd, connfd;
-    struct sockaddr_un servaddr;
-
-    sockfd = socket(AF_UNIX, SOCK_STREAM, 0);
-    memset(&servaddr, 0, sizeof(servaddr));
-    servaddr.sun_family = AF_UNIX;
-    strcpy(servaddr.sun_path, path);
-
-    bind(sockfd, (struct sockaddr*)&servaddr, sizeof(servaddr));
-    listen(sockfd, 5);
-
-    while (1) {
-        connfd = accept(sockfd, NULL, NULL);
-        // קבלת הודעות (Stream)
-        while (1) {
-            char buffer[1024];
-            int n = read(connfd, buffer, sizeof(buffer));
-            if (n <= 0) break;
-            printf("Received: %s\n", buffer);
-        }
-        close(connfd);
-    }
-
-    close(sockfd);
-}
-
-void start_udscc_client(const char *path) {
+void start_udsss_server(const char *path, int *connfd) {
     int sockfd;
     struct sockaddr_un servaddr;
 
     sockfd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (sockfd < 0) {
+        perror("socket creation failed");
+        exit(EXIT_FAILURE);
+    }
+
     memset(&servaddr, 0, sizeof(servaddr));
     servaddr.sun_family = AF_UNIX;
     strcpy(servaddr.sun_path, path);
 
-    connect(sockfd, (struct sockaddr*)&servaddr, sizeof(servaddr));
+    if (bind(sockfd, (struct sockaddr*)&servaddr, sizeof(servaddr)) < 0) {
+        perror("bind failed");
+        close(sockfd);
+        exit(EXIT_FAILURE);
+    }
 
-    // שליחת הודעות (Stream)
-    while (1) {
-        char buffer[1024];
-        fgets(buffer, sizeof(buffer), stdin);
-        write(sockfd, buffer, strlen(buffer));
+    if (listen(sockfd, 5) < 0) {
+        perror("listen failed");
+        close(sockfd);
+        exit(EXIT_FAILURE);
+    }
+
+    printf("UNIX Domain Stream server started on path %s\n", path);
+
+    *connfd = accept(sockfd, NULL, NULL);
+    if (*connfd < 0) {
+        perror("accept failed");
+        close(sockfd);
+        exit(EXIT_FAILURE);
     }
 
     close(sockfd);
+}
+
+void start_udscc_client(const char *path, int *sockfd) {
+    struct sockaddr_un servaddr;
+
+    *sockfd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (*sockfd < 0) {
+        perror("socket creation failed");
+        exit(EXIT_FAILURE);
+    }
+
+    memset(&servaddr, 0, sizeof(servaddr));
+    servaddr.sun_family = AF_UNIX;
+    strcpy(servaddr.sun_path, path);
+
+    if (connect(*sockfd, (struct sockaddr*)&servaddr, sizeof(servaddr)) < 0) {
+        perror("connect failed");
+        close(*sockfd);
+        exit(EXIT_FAILURE);
+    }
+
+    printf("UNIX Domain Stream client connected to path %s\n", path);
 }
 
 void alarm_handler(int sig) {
@@ -367,7 +377,6 @@ int is_socket(int fd) {
     }
     return result == 0;
 }
-
 
 void handle_unix_io(int pipe_fd, int socket_fd, int output_fd, struct io_params *params) {
     char buffer[BUFFER_SIZE];
@@ -688,16 +697,30 @@ int main(int argc, char *argv[]) {
             input_fd = start_udp_server(port);
             params.input_is_udp = 1;
         } else if (strncmp(input_param, "UDSSD", 5) == 0) {
-            start_udssd_server(input_param + 5);
+            start_udssd_server(input_param + 5, &input_fd);
+            printf("input_fd: %d\n", input_fd);
             params.input_is_unix = 1;
         } else if (strncmp(input_param, "UDSSS", 5) == 0) {
-            start_udsss_server(input_param + 5);
+            start_udsss_server(input_param + 5, &input_fd);
             params.input_is_unix = 1;
         }
     }
 
     if (output_param && !is_bidirectional) {
         if (strncmp(output_param, "TCPC", 4) == 0) {
+            /* Explanation about what we are doing here:
+            We have a few variables that we need to initialize before we can call the start_tcp_client function.
+            this is the variable that we need to initialize:
+            - *output_param_copy: this variable is a copy of the output_param string,
+             we need to copy the string because the strtok function modifies the string.
+            - *hostname: this variable will store the hostname part of the output_param string.
+            - *port_str: this variable will store the port part of the output_param string.
+            - port: this variable will store the integer value of the port.
+            We check if the hostname and port_str are not NULL, 
+            if they are NULL we print an error message and return EXIT_FAILURE.
+            we free the memory allocated for the output_param_copy variable
+            because we don't need it anymore.
+            */
             char *output_param_copy = strdup(output_param + 4);
             char *hostname = strtok(output_param_copy, ",");
             char *port_str = strtok(NULL, ",");
@@ -723,10 +746,10 @@ int main(int argc, char *argv[]) {
             params.output_is_udp = 1;
             free(output_param_copy);
         } else if (strncmp(output_param, "UDSCD", 5) == 0) {
-            start_udsdc_client(output_param + 5);
+            start_udsdc_client(output_param + 5, &output_fd);
             params.output_is_unix = 1;
         } else if (strncmp(output_param, "UDSCS", 5) == 0) {
-            start_udscc_client(output_param + 5);
+            start_udscc_client(output_param + 5, &output_fd);
             params.output_is_unix = 1;
         }
     }
@@ -760,6 +783,7 @@ int main(int argc, char *argv[]) {
     // nc -u localhost 4050
 
     // Example 3: Run a command with input from a UDP server and output to a TCP client
+
     // run the following command in the terminal for listening to the TCP client at port 4455
     // nc -l 4455 
     // open another terminal and run the following command for running the mync program 
@@ -767,4 +791,77 @@ int main(int argc, char *argv[]) {
     // ./mync -e "./ttt 123456789" -i UDPS4050 -o TCPClocalhost,4455
     // open another terminal and run the following command for sending data to the UDP server at port 4050
     // nc -u localhost 4050
-    //ל0
+    
+
+    // Example 4: Run a command with input from a UDS server and output to a terminal
+
+    // run the following command in the terminal for listening to the UDS server at path /tmp/uds_datagram_server
+    // nc -lU /tmp/uds_datagram_server
+    // open another terminal and run the following command for running the mync program
+    // with the ttt command and input from the UDS server at path /tmp/uds_datagram_server and output to the terminal
+    // ./mync -e "./ttt 123456789" -i UDSSD/tmp/uds_datagram_server
+
+
+
+    // Example usage of the `mync` program with Unix Domain Sockets (UDS):
+
+    /* Example 1: Running `mync` with input from a UDS Datagram server and output to a UDS Datagram client
+
+    # Step 1: Open a terminal and run the following command to start a UDS Datagram server
+    ncat -lU /tmp/uds_datagram_server --udp
+
+    # Step 2: Open another terminal and run the following command to run the `mync` program
+    # with the `ttt` command, input from the UDS Datagram server, and output to a UDS Datagram client
+    ./mync -e "./ttt 123456789" -i UDSSD/tmp/uds_datagram_server -o UDSCD/tmp/uds_datagram_client
+
+    # Step 3: Open a third terminal and run the following command to send data to the UDS Datagram client
+    ncat -U /tmp/uds_datagram_client --udp
+    */
+
+    /* Example 2: Running `mync` with input from a UDS Stream server and output to a UDS Stream client
+
+    # Step 1: Open a terminal and run the following command to start a UDS Stream server
+    ncat -lU /tmp/uds_stream_server
+
+    # Step 2: Open another terminal and run the following command to run the `mync` program
+    # with the `ttt` command, input from the UDS Stream server, and output to a UDS Stream client
+    ./mync -e "./ttt 123456789" -i UDSSS/tmp/uds_stream_server -o UDSCS/tmp/uds_stream_client
+
+    # Step 3: Open a third terminal and run the following command to send data to the UDS Stream client
+    ncat -U /tmp/uds_stream_client
+
+    */
+
+    /* Example 3: Run a command with bidirectional communication using UDS Stream
+
+
+    ncat -lU /tmp/uds_bidirectional_server
+
+    # Step 2: Open another terminal and run the following command to run the `mync` program
+    # with the `ttt` command, input from the UDS Stream server, and output to the same UDS Stream server
+    ./mync -e "./ttt 123456789" -b UDSCS/tmp/uds_bidirectional_server
+
+    # Step 3: Open a third terminal and run the following command to send data to the UDS Stream server
+    ncat -U /tmp/uds_bidirectional_server
+
+    */
+
+
+
+   // Example usage of the `mync` program with Unix Domain Sockets (UDS) and socat:
+
+    /* Example 1: Running `mync` with input from a UDS Datagram server and output to a UDS Datagram client
+
+    # Step 1: Open a terminal and run the following command to start a UDS Datagram server
+    socat -u UNIX-RECV:/tmp/uds_datagram_server STDOUT
+
+    # Step 2: Open another terminal and run the following command to run the `mync` program
+    # with the `ttt` command, input from the UDS Datagram server, and output to a UDS Datagram client
+    ./mync -e "./ttt 123456789" -i UDSSD/tmp/uds_datagram_server -o UDSCD/tmp/uds_datagram_client
+
+    # Step 3: Open a third terminal and run the following command to send data to the UDS Datagram client
+    socat STDIN UNIX-SENDTO:/tmp/uds_datagram_client
+
+    */
+
+    

@@ -14,9 +14,20 @@
 #include <signal.h>
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <sys/un.h>
 
 #define BUFFER_SIZE 1024
 
+struct io_params {
+    int input_is_udp;
+    int output_is_udp;
+    int input_is_unix;
+    int output_is_unix;
+    struct sockaddr_in dest_addr;
+    socklen_t dest_addr_len;
+    struct sockaddr_un dest_unix_addr;
+    socklen_t dest_unix_addr_len;
+};
 
 
 void execute_program(char *command) {
@@ -92,20 +103,54 @@ void start_tcp_client(const char *hostname, int port, int *client_fd) {
         exit(EXIT_FAILURE);
     }
 
+
     for (p = res; p != NULL; p = p->ai_next) {
         if ((sockfd = socket(p->ai_family, p->ai_socktype, p->ai_protocol)) == -1) {
             perror("socket");
             continue;
         }
 
-        if (connect(sockfd, p->ai_addr, p->ai_addrlen) == -1) {
-            close(sockfd);
-            perror("connect");
-            continue;
+        char ipstr[INET6_ADDRSTRLEN];
+        void *addr;
+        char *ipver;
+
+        if (p->ai_family == AF_INET) { // IPv4
+            struct sockaddr_in *ipv4 = (struct sockaddr_in *)p->ai_addr;
+            addr = &(ipv4->sin_addr);
+            ipver = "IPv4";
+        } 
+        else { // IPv6
+            struct sockaddr_in6 *ipv6 = (struct sockaddr_in6 *)p->ai_addr;
+            addr = &(ipv6->sin6_addr);
+            ipver = "IPv6";
         }
+
+        inet_ntop(p->ai_family, addr, ipstr, sizeof ipstr);
+        // printf("Trying to connect to %s (%s)\n", ipstr, ipver);
+
+        if (connect(sockfd, p->ai_addr, p->ai_addrlen) == -1) {
+            if (errno == ECONNREFUSED) {
+                    if (p->ai_family == AF_INET6) {
+                        fprintf(stderr, "Failed to connect to %s (%s): because no server is listening at the specified address and port, or the server is only listening on IPv4 (Connection refused)\n", ipstr, ipver);
+                    } 
+                    else {
+                        fprintf(stderr, "Failed to connect to %s (%s): because no server is listening at the specified address and port (Connection refused)\n", ipstr, ipver);
+                    }
+            } 
+            else if (errno == ETIMEDOUT) {
+                fprintf(stderr, "Failed to connect to %s (%s): because the connection timed out\n", ipstr, ipver);
+            } 
+            else {
+                fprintf(stderr, "Failed to connect to %s (%s): because %s\n", ipstr, ipver, strerror(errno));
+            }
+            close(sockfd);
+            continue;
+            }
 
         break; // successfully connected
     }
+
+   
 
     if (p == NULL) {
         fprintf(stderr, "Failed to connect to %s:%d\n", hostname, port);
@@ -119,66 +164,45 @@ void start_tcp_client(const char *hostname, int port, int *client_fd) {
 int start_udp_server(int port) {
     int sockfd;
 
-    // Create a socket for IPv6 UDP communication
-    // AF_INET6 is the address family for IPv6
-    // SOCK_DGRAM is the socket type for UDP
-    // 0 is the protocol value, which is 0 because it is automatically chosen based on the address family and socket type
+    // Create socket
     sockfd = socket(AF_INET6, SOCK_DGRAM, 0);  // SOCK_DGRAM for UDP
     if (sockfd < 0) {
-        // If socket creation fails, print an error message and exit
         perror("socket creation failed");
         exit(EXIT_FAILURE);
     }
-    // Debugging line to confirm socket creation
-    printf("Socket created with fd: %d\n", sockfd);
 
-    int opt = 0;
+    int opt = 1;
 
     // Allow the socket to bind to both IPv4 and IPv6 addresses
     if (setsockopt(sockfd, IPPROTO_IPV6, IPV6_V6ONLY, &opt, sizeof(opt)) < 0) {
-        // If setting socket option fails, print an error message and exit
         perror("setsockopt IPV6_V6ONLY failed");
         close(sockfd);
         exit(EXIT_FAILURE);
     }
-    // Debugging line to confirm setsockopt success for IPV6_V6ONLY
-    printf("setsockopt IPV6_V6ONLY succeeded\n");
 
-    opt = 1;
-
-    // Set the socket option to reuse the address, allowing the server to restart quickly after a crash
     if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
-        // If setting socket option fails, print an error message and exit
         perror("setsockopt SO_REUSEADDR failed");
         close(sockfd);
         exit(EXIT_FAILURE);
     }
-    // Debugging line to confirm setsockopt success for SO_REUSEADDR
-    printf("setsockopt SO_REUSEADDR succeeded\n");
 
-    // Initialize server address structure to zero
     struct sockaddr_in6 server_addr;
+
     memset(&server_addr, 0, sizeof(server_addr));
     
-    // Fill server information for IPv6
-    server_addr.sin6_family = AF_INET6; // Set address family to IPv6
+    // Fill server information
+    server_addr.sin6_family = AF_INET6; // IPv6
     server_addr.sin6_addr = in6addr_any; // Accept connections on any IP address (both IPv4 and IPv6)
-    server_addr.sin6_port = htons(port); // Set the port number, converting from host byte order to network byte order
+    server_addr.sin6_port = htons(port);
 
     // Bind the socket with the server address
     if (bind(sockfd, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
-        // If binding the socket fails, print an error message and exit
         perror("bind failed");
         close(sockfd);
         exit(EXIT_FAILURE);
     }
-    // Debugging line to confirm successful bind
-    printf("bind succeeded\n");
 
-    // Print the message that the UDP server has started
     printf("UDP server started on port %d\n", port);
-    
-    // Return the socket file descriptor
     return sockfd;
 }
 
@@ -240,6 +264,104 @@ void start_udp_client(const char *hostname, int port, int *client_fd, struct soc
     freeaddrinfo(res);
 }
 
+void start_udssd_server(const char *path, int *sockfd) {
+    struct sockaddr_un servaddr;
+
+    *sockfd = socket(AF_UNIX, SOCK_DGRAM, 0);
+    if (*sockfd < 0) {
+        perror("socket creation failed");
+        exit(EXIT_FAILURE);
+    }
+
+    memset(&servaddr, 0, sizeof(servaddr));
+    servaddr.sun_family = AF_UNIX;
+    strcpy(servaddr.sun_path, path);
+
+    if (bind(*sockfd, (struct sockaddr*)&servaddr, sizeof(servaddr)) < 0) {
+        perror("bind failed");
+        close(*sockfd);
+        exit(EXIT_FAILURE);
+    }
+
+    printf("UNIX Domain Datagram server started on path %s\n", path);
+}
+
+void start_udsdc_client(const char *path, int *sockfd) {
+    struct sockaddr_un servaddr;
+
+    *sockfd = socket(AF_UNIX, SOCK_DGRAM, 0);
+    if (*sockfd < 0) {
+        perror("socket creation failed");
+        exit(EXIT_FAILURE);
+    }
+
+    memset(&servaddr, 0, sizeof(servaddr));
+    servaddr.sun_family = AF_UNIX;
+    strcpy(servaddr.sun_path, path);
+
+    printf("UNIX Domain Datagram client started on path %s\n", path);
+}
+
+void start_udsss_server(const char *path, int *connfd) {
+    int sockfd;
+    struct sockaddr_un servaddr;
+
+    sockfd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (sockfd < 0) {
+        perror("socket creation failed");
+        exit(EXIT_FAILURE);
+    }
+
+    memset(&servaddr, 0, sizeof(servaddr));
+    servaddr.sun_family = AF_UNIX;
+    strcpy(servaddr.sun_path, path);
+
+    if (bind(sockfd, (struct sockaddr*)&servaddr, sizeof(servaddr)) < 0) {
+        perror("bind failed");
+        close(sockfd);
+        exit(EXIT_FAILURE);
+    }
+
+    if (listen(sockfd, 5) < 0) {
+        perror("listen failed");
+        close(sockfd);
+        exit(EXIT_FAILURE);
+    }
+
+    printf("UNIX Domain Stream server started on path %s\n", path);
+
+    *connfd = accept(sockfd, NULL, NULL);
+    if (*connfd < 0) {
+        perror("accept failed");
+        close(sockfd);
+        exit(EXIT_FAILURE);
+    }
+
+    close(sockfd);
+}
+
+void start_udscc_client(const char *path, int *sockfd) {
+    struct sockaddr_un servaddr;
+
+    *sockfd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (*sockfd < 0) {
+        perror("socket creation failed");
+        exit(EXIT_FAILURE);
+    }
+
+    memset(&servaddr, 0, sizeof(servaddr));
+    servaddr.sun_family = AF_UNIX;
+    strcpy(servaddr.sun_path, path);
+
+    if (connect(*sockfd, (struct sockaddr*)&servaddr, sizeof(servaddr)) < 0) {
+        perror("connect failed");
+        close(*sockfd);
+        exit(EXIT_FAILURE);
+    }
+
+    printf("UNIX Domain Stream client connected to path %s\n", path);
+}
+
 void alarm_handler(int sig) {
     fprintf(stderr, "Timeout reached, terminating processes\n");
     exit(EXIT_FAILURE);
@@ -250,27 +372,13 @@ int is_socket(int fd) {
     struct sockaddr_storage addr;
     socklen_t len = sizeof(addr);
     int result = getsockname(fd, (struct sockaddr *)&addr, &len);
-    printf("getsockname result: %d\n", result);
     if (result == -1) {
         perror("getsockname");
     }
     return result == 0;
 }
 
-
-
-void check_open_fds() {
-    printf("Open file descriptors:\n");
-    for (int fd = 0; fd < 256; fd++) {
-        if (fcntl(fd, F_GETFD) != -1) {
-            printf("FD %d is open\n", fd);
-        }
-    }
-}
-
-
-void handle_io(int pipe_fd, int socket_fd, int output_fd, int input_is_udp, int output_is_udp, struct sockaddr_in *dest_addr, socklen_t dest_addr_len) {
-    printf("someone called handle_io\n");
+void handle_unix_io(int pipe_fd, int socket_fd, int output_fd, struct io_params *params) {
     char buffer[BUFFER_SIZE];
     struct pollfd fds[2];
     int nfds = 2;
@@ -283,40 +391,9 @@ void handle_io(int pipe_fd, int socket_fd, int output_fd, int input_is_udp, int 
     fds[1].fd = socket_fd;
     fds[1].events = POLLIN;
 
-
-
-    // int is_udp = (dest_addr != NULL);  // Check if the connection is UDP
-    // printf("Before checking is_socket in handle_io\n");
-
-    
-    // int input_is_socket = is_socket(input_fd); // Check if input_fd is a socket
-    // printf("After checking is_socket in handle_io\n");
-    // printf("input_is_socket is %d\n", input_is_socket);
-
-    // printf("is_udp is %d\n", is_udp);
-
-    printf("input_is_udp is %d\n", input_is_udp);
-    printf("output_is_udp is %d\n", output_is_udp);
-
-    // if (!input_is_socket) {
-    //     fprintf(stderr, "Error: input_fd is not a socket\n");
-    //     return;
-    // }
-
     while (1) {
-        // printf("Polling for events...\n");
         int ret = poll(fds, nfds, -1);
-        
-        // Printing which fds have data ready
-        printf("After poll, the fds that have data ready are: \n");
-        if (fds[0].revents & POLLIN) {
-            printf("pipe_fd.\n");
-        }
-        if (fds[1].revents & POLLIN) {
-            printf("socket_fd.\n");
-        }
-        printf("\n");
-       
+
         if (ret == -1) {
             perror("poll");
             exit(EXIT_FAILURE);
@@ -325,40 +402,159 @@ void handle_io(int pipe_fd, int socket_fd, int output_fd, int input_is_udp, int 
         // Handle pipe input (output from child process)
         if (fds[0].revents & POLLIN) {
             ssize_t n = read(fds[0].fd, buffer, BUFFER_SIZE);
-            printf("this is the input from the pipe ---%s--- \n", buffer);
             if (n <= 0) {
                 if (n < 0) perror("read");
                 return;
             }
             buffer[n] = '\0';
-            // printf("on fds[0].revents & POLLIN condition, Received from pipe: %s\n", buffer);
 
-            // Send to output_fd (could be a socket or STDOUT)
-            if (output_is_udp) {
-                ssize_t sent = sendto(output_fd, buffer, n, 0, (struct sockaddr *)dest_addr, dest_addr_len);
+            // Send to output_fd (could be a Unix domain socket or STDOUT)
+            if (params->output_is_unix) {
+                ssize_t sent = sendto(output_fd, buffer, n, 0, (struct sockaddr *)&params->dest_unix_addr, params->dest_unix_addr_len);
                 if (sent == -1) {
                     perror("sendto");
                     return;
                 }
-                printf("Sent %zd bytes to %s:%d\n", sent, inet_ntoa(dest_addr->sin_addr), ntohs(dest_addr->sin_port));
-            }
-            // output is not udp
-             else {
+                printf("Sent %zd bytes to %s\n", sent, params->dest_unix_addr.sun_path);
+            } else {
                 ssize_t written = write(output_fd, buffer, n);
-                printf("this is the output from the socket +++%s+++ \n", buffer);
                 if (written != n) {
                     perror("write");
                     return;
                 }
-                // printf("on fds[0].revents & POLLIN condition, Written: %s\n", buffer);
+            }
+        }
+
+        // Handle socket input (data from Unix domain socket)
+        if (fds[1].revents & POLLIN) {
+            ssize_t n = recvfrom(fds[1].fd, buffer, BUFFER_SIZE, 0, NULL, NULL);
+            if (n == -1) {
+                perror("recvfrom");
+                return;
+            }
+            buffer[n] = '\0';
+
+            // Send to output_fd (could be a pipe or another socket)
+            if (params->output_is_unix) {
+                ssize_t sent = sendto(output_fd, buffer, n, 0, (struct sockaddr *)&params->dest_unix_addr, params->dest_unix_addr_len);
+                if (sent == -1) {
+                    perror("sendto");
+                    return;
+                }
+                printf("Sent %zd bytes to %s\n", sent, params->dest_unix_addr.sun_path);
+            } else {
+                ssize_t written = write(output_fd, buffer, n);
+                if (written != n) {
+                    perror("write");
+                    return;
+                }
+            }
+        }
+    }
+}
+
+void handle_unix_process(char *command, int input_fd, int output_fd, struct io_params *params) {
+    int pipe_out[2];
+    if (pipe(pipe_out) == -1) {
+        perror("pipe");
+        exit(EXIT_FAILURE);
+    }
+
+    pid_t pid = fork();
+    if (pid == -1) {
+        perror("fork");
+        exit(EXIT_FAILURE);
+    }
+
+    if (pid == 0) {
+        // Child process
+        if (input_fd != STDIN_FILENO) {
+            dup2(input_fd, STDIN_FILENO);
+        }
+        close(pipe_out[0]);
+
+        if (output_fd != STDOUT_FILENO) {
+            dup2(output_fd, STDOUT_FILENO);
+        } else {
+            dup2(pipe_out[1], STDOUT_FILENO);
+        }
+        close(pipe_out[1]);
+        execute_program(command);
+    } else {
+        // Parent process
+        close(pipe_out[1]);
+        if (output_fd != STDOUT_FILENO || params->input_is_unix || params->output_is_unix) {
+            handle_unix_io(pipe_out[0], input_fd, output_fd, params);
+        } else {
+            char buffer[BUFFER_SIZE];
+            ssize_t n;
+            while ((n = read(pipe_out[0], buffer, BUFFER_SIZE - 1)) > 0) {
+                buffer[n] = '\0';
+                write(STDOUT_FILENO, buffer, n);
+            }
+        }
+        close(pipe_out[0]);
+        wait(NULL);
+    }
+}
+
+
+void handle_io(int pipe_fd, int socket_fd, int output_fd, struct io_params *params) {
+    if (params->input_is_unix || params->output_is_unix) {
+        handle_unix_io(pipe_fd, socket_fd, output_fd, params);
+        return;
+    } 
+
+    char buffer[BUFFER_SIZE];
+    struct pollfd fds[2];
+    int nfds = 2;
+
+    // fds[0] for pipe
+    fds[0].fd = pipe_fd;
+    fds[0].events = POLLIN;
+
+    // fds[1] for socket
+    fds[1].fd = socket_fd;
+    fds[1].events = POLLIN;
+
+    while (1) {
+        int ret = poll(fds, nfds, -1);
+
+        if (ret == -1) {
+            perror("poll");
+            exit(EXIT_FAILURE);
+        }
+
+        // Handle pipe input (output from child process)
+        if (fds[0].revents & POLLIN) {
+            ssize_t n = read(fds[0].fd, buffer, BUFFER_SIZE);
+            if (n <= 0) {
+                if (n < 0) perror("read");
+                return;
+            }
+            buffer[n] = '\0';
+
+            // Send to output_fd (could be a socket or STDOUT)
+            if (params->output_is_udp) {
+                ssize_t sent = sendto(output_fd, buffer, n, 0, (struct sockaddr *)&params->dest_addr, params->dest_addr_len);
+                if (sent == -1) {
+                    perror("sendto");
+                    return;
+                }
+                printf("Sent %zd bytes to %s:%d\n", sent, inet_ntoa(params->dest_addr.sin_addr), ntohs(params->dest_addr.sin_port));
+            } else {
+                ssize_t written = write(output_fd, buffer, n);
+                if (written != n) {
+                    perror("write");
+                    return;
+                }
             }
         }
 
         // Handle socket input (data from network)
         if (fds[1].revents & POLLIN) {
-            printf("fds[1].revents & POLLIN\n");
             ssize_t n;
-            if (input_is_udp) {
+            if (params->input_is_udp) {
                 n = recvfrom(fds[1].fd, buffer, BUFFER_SIZE, 0, NULL, NULL);
                 if (n == -1) {
                     perror("recvfrom");
@@ -372,100 +568,76 @@ void handle_io(int pipe_fd, int socket_fd, int output_fd, int input_is_udp, int 
                 }
             }
             buffer[n] = '\0';
-            // printf("Received from socket: %s\n", buffer);
 
             // Send to output_fd (could be a pipe or another socket)
-            if (output_is_udp) {
-                ssize_t sent = sendto(output_fd, buffer, n, 0, (struct sockaddr *)dest_addr, dest_addr_len);
+            if (params->output_is_udp) {
+                ssize_t sent = sendto(output_fd, buffer, n, 0, (struct sockaddr *)&params->dest_addr, params->dest_addr_len);
                 if (sent == -1) {
                     perror("sendto");
                     return;
                 }
-                printf("Sent %zd bytes to %s:%d\n", sent, inet_ntoa(dest_addr->sin_addr), ntohs(dest_addr->sin_port));
+                printf("Sent %zd bytes to %s:%d\n", sent, inet_ntoa(params->dest_addr.sin_addr), ntohs(params->dest_addr.sin_port));
             } else {
                 ssize_t written = write(output_fd, buffer, n);
                 if (written != n) {
                     perror("write");
                     return;
                 }
-                // printf("Written: %s\n", buffer);
             }
-   
         }
     }
-    printf("Exiting handle_io\n");
 
 }
 
-void handle_process(char *command, int input_fd, int output_fd, int input_is_udp, int output_is_udp, struct sockaddr_in *dest_addr, socklen_t dest_addr_len) {
-       
-        int pipe_out[2];
-        if (pipe(pipe_out) == -1) {
-            perror("pipe");
+void handle_process(char *command, int input_fd, int output_fd, struct io_params *params) {
+    if (params->input_is_unix || params->output_is_unix) {
+        handle_unix_process(command, input_fd, output_fd, params);
+        return;
+    }
+
+    int pipe_out[2];
+    if (pipe(pipe_out) == -1) {
+        perror("pipe");
         exit(EXIT_FAILURE);
-        }
-        printf("input_fd: %d\n", input_fd);
-        printf("output_fd: %d\n", output_fd);
+    }
 
-        pid_t pid = fork();
-        if (pid == -1) {
-            perror("fork");
+    pid_t pid = fork();
+    if (pid == -1) {
+        perror("fork");
         exit(EXIT_FAILURE);
+    }
+
+    if (pid == 0) {
+        // Child process
+        if (input_fd != STDIN_FILENO) {
+            dup2(input_fd, STDIN_FILENO);
         }
+        close(pipe_out[0]);
 
-        if (pid == 0) {
-             // Child process
-             printf("child process started\n");
-            if (input_fd != STDIN_FILENO) {
-                // we say to the child process to read the standard input
-                // from the input_fd instead the terminal
-                dup2(input_fd, STDIN_FILENO);
-            }
-            // close pipe_out[0] that means close the read end of the pipe
-            close(pipe_out[0]);
-          
-            // if (input_is_udp)
-            // {
-            //     close(input_fd);
-            // }
-            
-
-            if (output_fd != STDOUT_FILENO) {
-                // we say to the child process to write the standard output
-                // to the output_fd instead the terminal 
-                dup2(output_fd, STDOUT_FILENO);
-            } 
-            else {
-                // we say to the child process to write the standard output
-                // to the pipe instead the terminal
-                dup2(pipe_out[1], STDOUT_FILENO);
-            }
-            close(pipe_out[1]);
-            execute_program(command);
-        } 
-        else { // Parent process
-            printf("parent process started\n");
-            close(pipe_out[1]);
-            if (output_fd != STDOUT_FILENO || (input_is_udp || output_is_udp)) {
-                // If output_fd is not STDOUT or if the connection is UDP, handle I/O
-                handle_io(pipe_out[0], input_fd, output_fd, input_is_udp, output_is_udp, dest_addr, dest_addr_len);
-                // handle_io(input_fd, output_fd, input_is_udp, output_is_udp, dest_addr, dest_addr_len);
-
-            } 
-            else { 
-                // If output_fd is STDOUT and dest_addr is NULL, write directly to STDOUT
-                char buffer[BUFFER_SIZE];
-                ssize_t n;
-                while ((n = read(pipe_out[0], buffer, BUFFER_SIZE - 1)) > 0) {
-                    buffer[n] = '\0';
-                    write(STDOUT_FILENO, buffer, n);
-                }
-            }
-
-            close(pipe_out[0]);
-            wait(NULL);
+        if (output_fd != STDOUT_FILENO) {
+            dup2(output_fd, STDOUT_FILENO);
+        } else {
+            dup2(pipe_out[1], STDOUT_FILENO);
         }
-   }
+        close(pipe_out[1]);
+        execute_program(command);
+    } else {
+        // Parent process
+        close(pipe_out[1]);
+        if (output_fd != STDOUT_FILENO || params->input_is_udp || params->output_is_udp) {
+            handle_io(pipe_out[0], input_fd, output_fd, params);
+        } else {
+            char buffer[BUFFER_SIZE];
+            ssize_t n;
+            while ((n = read(pipe_out[0], buffer, BUFFER_SIZE - 1)) > 0) {
+                buffer[n] = '\0';
+                write(STDOUT_FILENO, buffer, n);
+            }
+        }
+        close(pipe_out[0]);
+        wait(NULL);
+    }
+}
 
 int main(int argc, char *argv[]) {
     int opt;
@@ -474,15 +646,8 @@ int main(int argc, char *argv[]) {
     char *output_param = NULL;
     int is_bidirectional = 0;
     int timeout = 0;
-    int input_is_udp = 0; // Check if input is a UDP connection
-    int output_is_udp = 0; // Check if output is a UDP connection
 
-    struct sockaddr_in dest_addr;
-    socklen_t dest_addr_len = sizeof(dest_addr);
-
-
-    printf("dest_addr is %p\n", &dest_addr);
-    printf("Starting main function...\n");
+    struct io_params params = {0}; // Initialize the params struct
 
     // Parse command line arguments using getopt 
     while ((opt = getopt(argc, argv, "e:i:o:b:t:")) != -1) {
@@ -530,15 +695,32 @@ int main(int argc, char *argv[]) {
         } else if (strncmp(input_param, "UDPS", 4) == 0) {
             int port = atoi(input_param + 4);
             input_fd = start_udp_server(port);
-            input_is_udp = 1;
-            // if (!output_param) {
-            //     output_fd = input_fd;
-            // }
+            params.input_is_udp = 1;
+        } else if (strncmp(input_param, "UDSSD", 5) == 0) {
+            start_udssd_server(input_param + 5, &input_fd);
+            printf("input_fd: %d\n", input_fd);
+            params.input_is_unix = 1;
+        } else if (strncmp(input_param, "UDSSS", 5) == 0) {
+            start_udsss_server(input_param + 5, &input_fd);
+            params.input_is_unix = 1;
         }
     }
 
     if (output_param && !is_bidirectional) {
         if (strncmp(output_param, "TCPC", 4) == 0) {
+            /* Explanation about what we are doing here:
+            We have a few variables that we need to initialize before we can call the start_tcp_client function.
+            this is the variable that we need to initialize:
+            - *output_param_copy: this variable is a copy of the output_param string,
+             we need to copy the string because the strtok function modifies the string.
+            - *hostname: this variable will store the hostname part of the output_param string.
+            - *port_str: this variable will store the port part of the output_param string.
+            - port: this variable will store the integer value of the port.
+            We check if the hostname and port_str are not NULL, 
+            if they are NULL we print an error message and return EXIT_FAILURE.
+            we free the memory allocated for the output_param_copy variable
+            because we don't need it anymore.
+            */
             char *output_param_copy = strdup(output_param + 4);
             char *hostname = strtok(output_param_copy, ",");
             char *port_str = strtok(NULL, ",");
@@ -560,18 +742,23 @@ int main(int argc, char *argv[]) {
                 return EXIT_FAILURE;
             }
             int port = atoi(port_str);
-            start_udp_client(hostname, port, &output_fd, &dest_addr);
-            output_is_udp = 1;
+            start_udp_client(hostname, port, &output_fd, &params.dest_addr);
+            params.output_is_udp = 1;
             free(output_param_copy);
+        } else if (strncmp(output_param, "UDSCD", 5) == 0) {
+            start_udsdc_client(output_param + 5, &output_fd);
+            params.output_is_unix = 1;
+        } else if (strncmp(output_param, "UDSCS", 5) == 0) {
+            start_udscc_client(output_param + 5, &output_fd);
+            params.output_is_unix = 1;
         }
     }
 
     if (command) {
-        handle_process(command, input_fd, output_fd, input_is_udp, output_is_udp, &dest_addr, dest_addr_len);
+        handle_process(command, input_fd, output_fd, &params);
     } else {
-        handle_io(input_fd, input_fd, output_fd, input_is_udp, output_is_udp, &dest_addr, dest_addr_len);
+        handle_io(input_fd, input_fd, output_fd, &params);
     }
-
 
     // Close file descriptors
     if (input_fd != STDIN_FILENO) close(input_fd);
@@ -581,7 +768,7 @@ int main(int argc, char *argv[]) {
 }
 
 
-    // Example usage:
+ // Example usage:
 
     // Example 1: Run a command with input from a UDp server to the standard output (STDOUT)
     // run the following command in the terminal
@@ -596,6 +783,7 @@ int main(int argc, char *argv[]) {
     // nc -u localhost 4050
 
     // Example 3: Run a command with input from a UDP server and output to a TCP client
+
     // run the following command in the terminal for listening to the TCP client at port 4455
     // nc -l 4455 
     // open another terminal and run the following command for running the mync program 
@@ -603,7 +791,77 @@ int main(int argc, char *argv[]) {
     // ./mync -e "./ttt 123456789" -i UDPS4050 -o TCPClocalhost,4455
     // open another terminal and run the following command for sending data to the UDP server at port 4050
     // nc -u localhost 4050
-    //
+    
+
+    // Example 4: Run a command with input from a UDS server and output to a terminal
+
+    // run the following command in the terminal for listening to the UDS server at path /tmp/uds_datagram_server
+    // nc -lU /tmp/uds_datagram_server
+    // open another terminal and run the following command for running the mync program
+    // with the ttt command and input from the UDS server at path /tmp/uds_datagram_server and output to the terminal
+    // ./mync -e "./ttt 123456789" -i UDSSD/tmp/uds_datagram_server
 
 
 
+    // Example usage of the `mync` program with Unix Domain Sockets (UDS):
+
+    /* Example 1: Running `mync` with input from a UDS Datagram server and output to a UDS Datagram client
+
+    # Step 1: Open a terminal and run the following command to start a UDS Datagram server
+    ncat -lU /tmp/uds_datagram_server --udp
+
+    # Step 2: Open another terminal and run the following command to run the `mync` program
+    # with the `ttt` command, input from the UDS Datagram server, and output to a UDS Datagram client
+    ./mync -e "./ttt 123456789" -i UDSSD/tmp/uds_datagram_server -o UDSCD/tmp/uds_datagram_client
+
+    # Step 3: Open a third terminal and run the following command to send data to the UDS Datagram client
+    ncat -U /tmp/uds_datagram_client --udp
+    */
+
+    /* Example 2: Running `mync` with input from a UDS Stream server and output to a UDS Stream client
+
+    # Step 1: Open a terminal and run the following command to start a UDS Stream server
+    ncat -lU /tmp/uds_stream_server
+
+    # Step 2: Open another terminal and run the following command to run the `mync` program
+    # with the `ttt` command, input from the UDS Stream server, and output to a UDS Stream client
+    ./mync -e "./ttt 123456789" -i UDSSS/tmp/uds_stream_server -o UDSCS/tmp/uds_stream_client
+
+    # Step 3: Open a third terminal and run the following command to send data to the UDS Stream client
+    ncat -U /tmp/uds_stream_client
+
+    */
+
+    /* Example 3: Run a command with bidirectional communication using UDS Stream
+
+
+    ncat -lU /tmp/uds_bidirectional_server
+
+    # Step 2: Open another terminal and run the following command to run the `mync` program
+    # with the `ttt` command, input from the UDS Stream server, and output to the same UDS Stream server
+    ./mync -e "./ttt 123456789" -b UDSCS/tmp/uds_bidirectional_server
+
+    # Step 3: Open a third terminal and run the following command to send data to the UDS Stream server
+    ncat -U /tmp/uds_bidirectional_server
+
+    */
+
+
+
+   // Example usage of the `mync` program with Unix Domain Sockets (UDS) and socat:
+
+    /* Example 1: Running `mync` with input from a UDS Datagram server and output to a UDS Datagram client
+
+    # Step 1: Open a terminal and run the following command to start a UDS Datagram server
+    socat -u UNIX-RECV:/tmp/uds_datagram_server STDOUT
+
+    # Step 2: Open another terminal and run the following command to run the `mync` program
+    # with the `ttt` command, input from the UDS Datagram server, and output to a UDS Datagram client
+    ./mync -e "./ttt 123456789" -i UDSSD/tmp/uds_datagram_server -o UDSCD/tmp/uds_datagram_client
+
+    # Step 3: Open a third terminal and run the following command to send data to the UDS Datagram client
+    socat STDIN UNIX-SENDTO:/tmp/uds_datagram_client
+
+    */
+
+    
