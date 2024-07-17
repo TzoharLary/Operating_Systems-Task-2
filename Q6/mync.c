@@ -24,6 +24,8 @@ struct io_params {
     int output_is_udp;
     int input_is_unix;
     int output_is_unix;
+    int input_is_tcp;
+    int output_is_tcp;
     struct sockaddr_in dest_addr;
     socklen_t dest_addr_len;
     struct sockaddr_un dest_unix_addr;
@@ -225,6 +227,7 @@ void start_udp_client(const char *hostname, int port, int *client_fd, struct soc
         exit(EXIT_FAILURE);
     }
 
+    // create a socket and connect to the server
     for (p = res; p != NULL; p = p->ai_next) {
         if ((sockfd = socket(p->ai_family, p->ai_socktype, p->ai_protocol)) == -1) {
             perror("socket");
@@ -308,37 +311,64 @@ void start_udssd_server(const char *path, int *sockfd, struct io_params *params)
 }
 
 void start_udscd_client(const char *path, int *sockfd, struct io_params *params) {
-    struct sockaddr_un servaddr;
-    printf("enter to start_udssd_client\n");
+    printf("enter to start_udscd_client\n");
+    struct sockaddr_un *addr = &(params->dest_unix_addr);
     *sockfd = socket(AF_UNIX, SOCK_DGRAM, 0);
     if (*sockfd < 0) {
         perror("socket creation failed");
         exit(EXIT_FAILURE);
     }
-    printf("Client Socket created successfully\n");
-
-    memset(&servaddr, 0, sizeof(servaddr));
-    servaddr.sun_family = AF_UNIX;
-    strncpy(servaddr.sun_path, path, sizeof(servaddr.sun_path) - 1);
-
-    printf("UNIX Domain Datagram client started on path %s\n", path);
-
-    // Send an initial message to create the socket file
-    const char *init_msg = "INIT";
-    ssize_t sent = sendto(*sockfd, init_msg, strlen(init_msg), 0, (struct sockaddr *)&servaddr, sizeof(servaddr));
-    if (sent == -1) {
-        perror("sendto");
+    printf("Client Socket created successfully, sockfd: %d\n", *sockfd);
+    
+    int sock_type;
+    socklen_t optlen = sizeof(sock_type);
+    if (getsockopt(*sockfd, SOL_SOCKET, SO_TYPE, &sock_type, &optlen) == -1) {
+        perror("getsockopt");
         close(*sockfd);
         exit(EXIT_FAILURE);
     }
-    printf("Initial message sent to %s\n", path);
 
-    // הגדרת הכתובת ואורכה בתוך params
-    params->input_is_unix = 1;
-    memset(&params->dest_unix_addr, 0, sizeof(params->dest_unix_addr));
-    params->dest_unix_addr.sun_family = AF_UNIX;
-    strcpy(params->dest_unix_addr.sun_path, path);
-    params->dest_unix_addr_len = sizeof(params->dest_unix_addr);
+    if (sock_type != SOCK_DGRAM) {
+        fprintf(stderr, "Socket type is not SOCK_DGRAM\n");
+        close(*sockfd);
+        exit(EXIT_FAILURE);
+    }
+    printf("Socket type is SOCK_DGRAM\n");
+
+    params->output_is_unix = 1;
+    memset((addr), 0, sizeof(*addr));
+    addr->sun_family = AF_UNIX;
+    printf("path: %s\n", path);
+    strncpy(addr->sun_path, path, sizeof(addr->sun_path) - 1);
+    params->dest_unix_addr_len = sizeof(*addr);
+    addr->sun_path[sizeof(addr->sun_path) - 1] = '\0'; // Ensure null-terminated string
+
+    printf("UNIX Domain Datagram client started on path %s\n", path);
+
+    // check if the socket file exists
+    if (access(path, F_OK) == -1) {
+        printf("Warning: Socket file %s does not exist\n", path);
+    }
+    // check if the client has read/write access to the socket file
+    if (access(path, R_OK | W_OK) == -1) {
+        perror("Client does not have read/write access to the socket file");
+        exit(EXIT_FAILURE);
+    } else {
+        printf("Client has read/write access to the socket file %s\n", path);
+    }
+
+
+    // Send an initial message to create the socket file
+    const char *init_msg = "first try message for socket creation\n";
+    ssize_t sent = sendto(*sockfd, init_msg, strlen(init_msg), 0, (struct sockaddr *)&params->dest_unix_addr, params->dest_unix_addr_len);
+    if (sent == -1) {
+        perror("Initial sendto failed");
+        exit(EXIT_FAILURE);
+    } else {
+        printf("we in the start_udscd_client function before handle_io and before handle_unix_io\n");
+        printf("Sent %zd bytes to %s\n", sent, path);
+    }
+    printf("end of start_udscd_client\n");
 }
 
 void start_udsss_server(const char *path, int *connfd) {
@@ -416,22 +446,26 @@ int is_socket(int fd) {
     return result == 0;
 }
 
-void handle_unix_io(int pipe_fd, int socket_fd, int output_fd, struct io_params *params) {
+void handle_unix_io(int pipe_fd, int input_fd, int output_fd, struct io_params *params) {
     printf("enter to handle_unix_io\n");
-    printf("pipe_fd: %d\n socket_fd: %d\n output_fd: %d\n", pipe_fd, socket_fd, output_fd);
+    printf("pipe_fd: %d\n input_fd: %d\n output_fd: %d\n", pipe_fd, input_fd, output_fd);
     char buffer[BUFFER_SIZE];
     struct pollfd fds[2];
     int nfds = 2;
     
-
+    
+    // ברגע שהגדרנו לו שהצינור יהיה הפלט, אז כל מה שנכנס לפלט נכנס לצינור בעצם
     // fds[0] for pipe - case when the child process writes to the pipe 
     // that's mean the output is stdout
     fds[0].fd = pipe_fd;
     fds[0].events = POLLIN;
 
-    // fds[1] for socket
-    fds[1].fd = socket_fd;
+
+    // זה מזהה הקובץ של הקלט
+    // fds[1] for input_fd 
+    fds[1].fd = input_fd;
     fds[1].events = POLLIN;
+   
 
     while (1) {
         
@@ -443,6 +477,8 @@ void handle_unix_io(int pipe_fd, int socket_fd, int output_fd, struct io_params 
         }
 
         // Handle pipe input (output from child process)
+        // אנחנו נכנסים לפה, כאשר יש פלט באמת מהתוכנית, והוא נכנס אוטומטית לצינור, ואנחנו רוצים להפנות אותו ללקוח שיפנה לשרת
+        // לכן כל מה שקורה פה זה לקחת את הפלט של התוכנית ולהפנות לצינור שיפנה ללקוח
         if (fds[0].revents & POLLIN) {
             printf("enter to fds[0].revents & POLLIN\n");
             ssize_t n = read(fds[0].fd, buffer, BUFFER_SIZE);
@@ -463,25 +499,50 @@ void handle_unix_io(int pipe_fd, int socket_fd, int output_fd, struct io_params 
                 printf("length: %zd\n", n);
                 printf("dest_unix_addr.sun_path: %s\n", params->dest_unix_addr.sun_path);
                 printf("dest_unix_addr_len: %d\n", params->dest_unix_addr_len);
+
+                // בדיקה אם קובץ הסוקט קיים
+                if (access(params->dest_unix_addr.sun_path, F_OK) == -1) {
+                    printf("Warning: Socket file %s does not exist\n", params->dest_unix_addr.sun_path);
+                }     
+                printf("we in the handle_unix_io function before sendto\n");
+
                 ssize_t sent = sendto(output_fd, buffer, n, 0, (struct sockaddr *)&params->dest_unix_addr, params->dest_unix_addr_len);
+                if (sent == -1) {
+                    perror("the sendto of handle_unix_io failed");
+                    perror("sent == -1");
+                    perror("sendto failed");
+                } else {
+                    printf("Successfully sent %zd bytes\n", sent);
+                }
+                printf("Sent %zd bytes to %s\n", sent, params->dest_unix_addr.sun_path);
+                // printf("Data sent: %s\n", buffer);
+            } 
+            // if the output is UDP
+            if (params->output_is_udp) {
+                ssize_t sent = sendto(output_fd, buffer, n, 0, (struct sockaddr *)&params->dest_addr, params->dest_addr_len);
                 if (sent == -1) {
                     perror("sendto");
                     return;
                 }
-                printf("Sent %zd bytes to %s\n", sent, params->dest_unix_addr.sun_path);
-                printf("Data sent: %s\n", buffer);
-            } else {
-                ssize_t written = write(output_fd, buffer, n);
-                if (written != n) {
-                    perror("write");
-                    return;
-                }
+                printf("Sent %zd bytes to %s:%d\n", sent, inet_ntoa(params->dest_addr.sin_addr), ntohs(params->dest_addr.sin_port));
+            }
+            // if the output is stdout or tcp
+            else if (output_fd == STDOUT_FILENO || params->output_is_tcp) {
+                printf("enter to else if output_fd == STDOUT_FILENO || params->output_is_tcp\n");
+                write(STDOUT_FILENO, buffer, n);
             }
         }
 
         // Handle socket input (data from Unix domain socket)
-        if (fds[1].revents & POLLIN) {
+        // אנחנו נכנסים לפה כאשר יש קלט והוא לא קלט סטנדרטי, ואנחנו רוצים לקרוא את הקלט ולהפנות אותו לתוכנית
+        if (fds[1].revents & POLLIN && input_fd != STDIN_FILENO) {
+            
             printf("enter to fds[1].revents & POLLIN\n");
+            printf("input_fd: %d\n", input_fd);
+            printf("in the fds[1] the buffer is: %s\n", buffer);
+            // הפונקציה לוקחת מה שרשום בקלט, ומעתיקה את זה לתוך הבאפר
+            // recvfrom is a function that receives a message from a socket and stores it in a buffer
+            // in this case, we are reading from the input_fd and storing the message in the buffer
             ssize_t n = recvfrom(fds[1].fd, buffer, BUFFER_SIZE, 0, NULL, NULL);
             if (n == -1) {
                 perror("recvfrom");
@@ -507,6 +568,9 @@ void handle_unix_io(int pipe_fd, int socket_fd, int output_fd, struct io_params 
                 }
             }
         }
+    
+    
+        
     }
 }
 
@@ -549,17 +613,14 @@ void handle_unix_process(char *command, int input_fd, int output_fd, struct io_p
         close(pipe_out[0]);
         printf("child process after close pipe_out[0]\n");
          
-
           if (output_fd != STDOUT_FILENO) {
+            // fcntl is a system call that can perform various operations on file descriptors
             if (fcntl(output_fd, F_GETFD) == -1) {
                 perror("fcntl (output_fd)");
                 exit(EXIT_FAILURE);
             }
             printf("output_fd is not stdout, output_fd2: %d\n", output_fd);
-            if (dup2(pipe_out[1], STDOUT_FILENO) == -1) {
-                perror("dup2");
-                exit(EXIT_FAILURE);
-            }
+            dup2(pipe_out[1], STDOUT_FILENO);
         } else {
             dup2(pipe_out[1], STDOUT_FILENO);
         } 
@@ -571,9 +632,9 @@ void handle_unix_process(char *command, int input_fd, int output_fd, struct io_p
         fprintf(stderr, "Debug: using fprintf and stderr before execute_program\n"); // Debug print
         // execute the command that the user entered
         execute_program(command);
-    } else {
-        // Parent process
-
+    }
+    // Parent process
+    else {
         close(pipe_out[1]);
         handle_unix_io(pipe_out[0], input_fd, output_fd, params);
         close(pipe_out[0]);
@@ -612,7 +673,6 @@ void handle_unix_process(char *command, int input_fd, int output_fd, struct io_p
         wait(NULL);
     }
 }
-
 
 void handle_io(int pipe_fd, int socket_fd, int output_fd, struct io_params *params) {
     if (params->input_is_unix || params->output_is_unix) {
@@ -804,9 +864,11 @@ int main(int argc, char *argv[]) {
 
     // Start server or client based on input and output parameters
     if (input_param) {
+        // According to the input instructions, there is no ability to output input if we are a uds customer
         if (strncmp(input_param, "TCPS", 4) == 0) {
             int port = atoi(input_param + 4);
             start_tcp_server(port, &input_fd);
+            params.input_is_tcp = 1;
             if (is_bidirectional) {
                 output_fd = input_fd;
             }
@@ -825,6 +887,7 @@ int main(int argc, char *argv[]) {
     }
 
     if (output_param && !is_bidirectional) {
+        // According to the output instructions, it is not possible to output if we are a uds server
         if (strncmp(output_param, "TCPC", 4) == 0) {
             char *output_param_copy = strdup(output_param + 4);
             char *hostname = strtok(output_param_copy, ",");
@@ -836,6 +899,7 @@ int main(int argc, char *argv[]) {
             }
             int port = atoi(port_str);
             start_tcp_client(hostname, port, &output_fd);
+            params.output_is_tcp = 1;
             free(output_param_copy);
         } else if (strncmp(output_param, "UDPC", 4) == 0) {
             char *output_param_copy = strdup(output_param + 4);
@@ -852,13 +916,8 @@ int main(int argc, char *argv[]) {
             free(output_param_copy);
         } else if (strncmp(output_param, "UDSCD", 5) == 0) {
             start_udscd_client(output_param + 5, &output_fd, &params);  
-        } else if (strncmp(output_param, "UDSSD", 5) == 0) {
-          start_udssd_server(output_param + 5, &output_fd, &params);   
-        }else if (strncmp(output_param, "UDSCS", 5) == 0) {
+        } else if (strncmp(output_param, "UDSCS", 5) == 0) {
             start_udscs_client(output_param + 5, &output_fd);
-            params.output_is_unix = 1;
-        }else if (strncmp(output_param, "UDSSS", 5) == 0) {
-            start_udsss_server(output_param + 5, &output_fd);
             params.output_is_unix = 1;
         }
     }
@@ -876,49 +935,55 @@ int main(int argc, char *argv[]) {
     return EXIT_SUCCESS;
 }
 
-
+//socat - UNIX-RECVFROM:/tmp/uds_datagram_server,fork
  // Example usage:
 
-    // Example 1: Run a command with input from a UDp server to the standard output (STDOUT)
+    // Example 1: Run a command with input from a UDP server to the standard output (STDOUT)
     // run the following command in the terminal
     //  ./mync -e "./ttt 123456789" -i UDPS4050
     // open another terminal and run the following command
-    // nc -u localhost 4050
+    // ncat -u localhost 4050
 
     // Example 2: Run a command with input from a UDP server and kill the process after 10 seconds
     // run the following command in the terminal
     // ./mync -e "./ttt 123456789" -i UDPS4050 -t 10
     // open another terminal and run the following command
-    // nc -u localhost 4050
+    // ncat -u localhost 4050
 
     /* Example 3: Run a command with input from a UDP server and output to a TCP client
 
     // run the following command in the terminal for listening to the TCP client at port 4455
-    // nc -l 4455 
+    // ncat -l 4455 
     // open another terminal and run the following command for running the mync program 
     // with the ttt command and input from the UDP server at port 4050 and output to the TCP client at port 4455
     // ./mync -e "./ttt 123456789" -i UDPS4050 -o TCPClocalhost,4455
     // open another terminal and run the following command for sending data to the UDP server at port 4050
-    // nc -u localhost 4050
+    // ncat -u localhost 4050
     */
     
+    /* Example 4: Run a command with input from a UDS server and output to a terminal
 
-    // Example 4: Run a command with input from a UDS server and output to a terminal
+    run the following command in the terminal for 
+    
+    open another terminal and run the following command for running the mync program
+    with the ttt command and input from the UDS server at path /tmp/uds_datagram_server and output to the terminal
+    ./mync -e "./ttt 123456789" -i UDSSD/tmp/uds_datagram_server
+    open another terminal and run the following command for input to the UDS server at path /tmp/uds_datagram_server
+    ncat -Uu /tmp/uds_datagram_server
+    socat - UNIX-RECVFROM:/tmp/uds_datagram_server,fork
+    */
+   
+    /*     Example 5: Run a command with output to a UDP 
 
-    // run the following command in the terminal for listening to the UDS server at path /tmp/uds_datagram_server
-    // nc -lU /tmp/uds_datagram_server
-    // open another terminal and run the following command for running the mync program
-    // with the ttt command and input from the UDS server at path /tmp/uds_datagram_server and output to the terminal
-    // ./mync -e "./ttt 123456789" -i UDSSD/tmp/uds_datagram_server
-
-
-
+   
+   */
+   
     // Example usage of the `mync` program with Unix Domain Sockets (UDS):
 
     /* Example 1: Running `mync` with input from a UDS Datagram server and output to a UDS Datagram client
 
     # Step 1: Open a terminal and run the following command to start a UDS Datagram server
-    ncat -lU /tmp/uds_datagram_server --udp
+    ncat -lU /tmp/uds_datagram_server
 
     # Step 2: Open another terminal and run the following command to run the `mync` program
     # with the `ttt` command, input from the UDS Datagram server, and output to a UDS Datagram client
@@ -927,7 +992,6 @@ int main(int argc, char *argv[]) {
     # Step 3: Open a third terminal and run the following command to send data to the UDS Datagram client
     ncat -U /tmp/uds_datagram_client --udp
     */
-
 
     /* Example 2: Running `mync` with input from a UDS Stream server and output to a UDS Stream client
 
@@ -960,11 +1024,11 @@ int main(int argc, char *argv[]) {
    /* Example 4: Running `mync` with input from a terminal and output to a UDS Datagram server
 
     # Step 1: Open a terminal and run the following command to start a UDS Datagram server
-    ncat -lU /tmp/uds_datagram_server --udp
+    ncat -lU /tmp/uds_datagram_server 
 
     # Step 2: Open another terminal and run the following command to run the `mync` program
     # with the `ttt` command, and output to the UDS Datagram server
-    ./mync -e "./ttt 123456789" -o UDSSD/tmp/uds_datagram_server
+    ./mync -e "./ttt 123456789" -o UDSCD/tmp/uds_datagram_server
 
     */
 
